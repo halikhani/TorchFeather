@@ -50,6 +50,75 @@ class Attention(nn.Module):
         self.inner_attention = ScaledDotProductAttentionWrapper()
 
 
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor):
+        batch_size, seq_len, _ = x.shape
+
+        # Query projection
+        if self.q_lora_rank == 0:
+            q = self.wq(x) # (batch_size, seq_len, n_heads * qk_head_dim)
+        else:
+            q = self.wq_a(x) # (batch_size, seq_len, q_lora_rank)
+            q = self.wq_b(self.q_norm(q)) # (batch_size, seq_len, n_heads * qk_head_dim)
+
+        # q: [batch_size, seq_len, n_heads, qk_head_dim]
+        q = q.view(batch_size, seq_len, self.n_heads, self.qk_head_dim)
+        # q_nope: [batch_size, seq_len, n_heads, qk_nope_head_dim]
+        # q_rope: [batch_size, seq_len, n_heads, qk_rope_head_dim]
+        q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        q_rope = apply_rotary_emb(q_rope, freqs_cis)
+        # q: (batch_size, seq_len, n_heads, qk_head_dim)
+        q = torch.cat([q_nope, q_rope], dim=-1)
+
+        # Key-value projection
+        # kv: [batch_size, seq_len, kv_lora_rank + qk_rope_head_dim]
+
+        kv = self.wkv_a(x) # [batch_size, seq_len, self.kv_lora_rank + self.qk_rope_head_dim]
+        # kv: [batch_size, seq_len, kv_lora_rank] --- this is the compressed latent
+        # k_rope: [batch_size, seq_len, qk_rope_head_dim] --- this is the decoupled RoPE for K
+        kv, k_rope = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        # k_rope: [batch_size, seq_len, 1, qk_rope_head_dim]
+        k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freqs_cis)
+
+        # up projection to rebuild the full KV
+        # the up projection also contains W_V, which is usually kept separate
+        # kv: [batch_size, seq_len, n_heads * (qk_nope_head_dim + v_head_dim)]
+
+        kv = self.wkv_b(self.kv_norm(kv))
+        # kv: [batch_size, seq_len, n_heads, qk_nope_head_dim + v_head_dim]
+        kv = kv.view(batch_size, seq_len, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
+        # k_nope: [batch_size, seq_len, n_heads, qk_nope_head_dim]
+        # v: [batch_size, seq_len, n_heads, v_head_dim]
+        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        # k: (batch_size, seq_len, n_heads, qk_head_dim)
+        # we need to expand k_rope because it is shared for every K heads. This basically adds a new dimension with 0 stride.
+        k = torch.cat([k_nope, k_rope.expand(-1, -1, self.n_heads, -1)], dim=-1)
+
+
+        # q: [batch_size, n_heads, seq_len, qk_head_dim]
+        q = q.transpose(1, 2)
+        # k: [batch_size, n_heads, seq_len, qk_head_dim]
+        k = k.transpose(1, 2)
+        # v: [batch_size, n_heads, seq_len, v_head_dim]
+        v = v.transpose(1, 2)
+
+        # attention as usual
+        attn_output = self.inner_attention(q, k, v, scale=self.softmax_scale)
+
+        # Reshape and project output
+        # output: [batch_size, seq_len, n_heads, v_head_dim]
+        output = attn_output.transpose(1, 2).contiguous()
+        # output: [batch_size, seq_len, n_heads * v_head_dim]
+        output = output.view(batch_size, seq_len, -1)
+        # output: [batch_size, seq_len, dim]
+        return self.wo(output)
+
+
+
+
+
+
+
 
 
 
