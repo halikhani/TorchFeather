@@ -113,6 +113,103 @@ class Attention(nn.Module):
         # output: [batch_size, seq_len, dim]
         return self.wo(output)
 
+    
+    @torch.no_grad()
+    def absorb_mla_weights(self) -> None:
+        if self.q_lora_rank != 0:
+            raise NotImplementedError("Absorbing MLA weights is not implemented for Q-LORA")
+        
+        n_heads = self.n_heads
+        dim = self.dim
+        qk_nope_head_dim = self.qk_nope_head_dim
+        qk_rope_head_dim = self.qk_rope_head_dim
+        v_head_dim = self.v_head_dim
+        kv_lora_rank = self.kv_lora_rank
+
+
+        device = self.wq.weight.device
+        dtype = self.wq.weight.dtype
+
+        wq = self.wq.weights.view(
+            n_heads,
+            qk_nope_head_dim + qk_rope_head_dim,
+            dim
+        )
+        # qk_nope : [n_heads, qk_nope_head_dim, dim]
+        # qk_rope : [n_heads, qk_rope_head_dim, dim]
+        wq_nope, wq_rope = torch.split(
+            wq, [qk_nope_head_dim, qk_rope_head_dim], dim=1
+        )
+
+        wkv_b = self.wkv_b.weights.view(
+            n_heads,
+            qk_nope_head_dim + v_head_dim,
+            kv_lora_rank
+        )
+        # w_uk : [n_heads, qk_nope_head_dim, kv_lora_rank] -- up projection for K after compressed latent
+        # w_uv : [n_heads, v_head_dim, kv_lora_rank] -- up projection for V after compressed latent
+        w_uk, w_uv = torch.split(
+            wkv_b, [qk_nope_head_dim, v_head_dim], dim=1
+        )
+
+        # [n_heads, kv_lora_rank, dim]
+        wq_abs_nope = torch.bmm(
+            w_uk.float().transpose(1, 2), # [n_heads, qk_nope_head_dim, kv_lora_rank] -> [n_heads, kv_lora_rank, qk_nope_head_dim]
+            wq_nope.float(), # [n_heads, qk_nope_head_dim, dim]
+        ).to(dtype=dtype)
+
+        # Each new query head is [absorbed nope | original RoPE].
+        wq_abs = torch.cat(
+            [wq_abs_nope, wq_rope],
+            dim=1
+        ).reshape(
+            n_heads * (kv_lora_rank + qk_rope_head_dim),
+            dim
+        )
+
+        self.wq_abs = nn.Linear(
+            dim,
+            n_heads * (kv_lora_rank + qk_rope_head_dim),
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+        self.wq_abs.weights.copy_(wq_abs) # weights copied from wq_abs to self.wq_abs.weights
+        self.wq_abs.requires_grad_(False)
+
+
+        # [dim, n_heads, v_head_dim] -> [n_heads, dim, v_head_dim]
+        w_o = self.wo.weights.view(
+            dim,
+            n_heads,
+            v_head_dim
+        ).permute(1, 0, 2)
+
+        # w_uv : [n_heads, v_head_dim, kv_lora_rank]
+        # [n_heads, dim, v_head_dim] @ [n_heads, v_head_dim, kv_lora_rank] -> [n_heads, dim, kv_lora_rank]
+        wo_abs_per_head = torch.bmm(
+            w_o.float(),
+            w_uv.float(),
+        ).to(dtype=dtype)
+
+        # [n_heads, dim, kv_lora_rank] -> [dim, n_heads, kv_lora_rank] -> [dim, n_heads * kv_lora_rank]
+        wo_abs = wo_abs_per_head.permute(1, 0, 2).reshape(
+            dim,
+            n_heads * kv_lora_rank,
+        )
+
+        self.wo_abs = nn.Linear(
+            n_heads * kv_lora_rank,
+            dim,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+
+        self.wo_abs.weights.copy_(wo_abs)
+        self.wo_abs.requires_grad_(False)
+
+    
 
 
 
