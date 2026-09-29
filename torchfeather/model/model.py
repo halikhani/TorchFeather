@@ -26,7 +26,7 @@ class Attention(nn.Module):
         )  # 128 + 64 = 192
         self.v_head_dim = model_args.v_head_dim  # 128
 
-        if self.q_lora_rank > 0:
+        if self.q_lora_rank == 0:
             self.wq = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
         else:
             self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
@@ -48,6 +48,29 @@ class Attention(nn.Module):
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
         self.inner_attention = ScaledDotProductAttentionWrapper()
+
+
+    def init_weights(
+        self,
+        init_std: float,
+        buffer_device: torch.device | None = None,
+    ):
+        linear_list = [
+            self.wkv_a,
+            self.wkv_b,
+        ]
+        if self.q_lora_rank > 0:
+            linear_list.extend([self.wq_a, self.wq_b])
+        else:
+            linear_list.append(self.wq)
+
+        for linear in linear_list:
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+
+        self.kv_norm.reset_parameters()
+        if self.q_lora_rank > 0:
+            self.q_norm.reset_parameters()
 
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor):
@@ -130,7 +153,7 @@ class Attention(nn.Module):
         device = self.wq.weight.device
         dtype = self.wq.weight.dtype
 
-        wq = self.wq.weights.view(
+        wq = self.wq.weight.view(
             n_heads,
             qk_nope_head_dim + qk_rope_head_dim,
             dim
@@ -141,7 +164,7 @@ class Attention(nn.Module):
             wq, [qk_nope_head_dim, qk_rope_head_dim], dim=1
         )
 
-        wkv_b = self.wkv_b.weights.view(
+        wkv_b = self.wkv_b.weight.view(
             n_heads,
             qk_nope_head_dim + v_head_dim,
             kv_lora_rank
@@ -174,12 +197,12 @@ class Attention(nn.Module):
             device=device,
             dtype=dtype,
         )
-        self.wq_abs.weights.copy_(wq_abs) # weights copied from wq_abs to self.wq_abs.weights
+        self.wq_abs.weight.copy_(wq_abs) # weights copied from wq_abs to self.wq_abs.weight
         self.wq_abs.requires_grad_(False)
 
 
         # [dim, n_heads, v_head_dim] -> [n_heads, dim, v_head_dim]
-        w_o = self.wo.weights.view(
+        w_o = self.wo.weight.view(
             dim,
             n_heads,
             v_head_dim
@@ -206,17 +229,82 @@ class Attention(nn.Module):
             dtype=dtype,
         )
 
-        self.wo_abs.weights.copy_(wo_abs)
+        self.wo_abs.weight.copy_(wo_abs)
         self.wo_abs.requires_grad_(False)
 
     
+    def forward_absorbed(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.wq_abs is not None
+        assert self.wo_abs is not None
 
 
+        batch_size, seq_len, _ = x.shape
 
+        q = self.wq_abs(x)
+        q = q.view(
+            batch_size,
+            seq_len,
+            self.n_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
 
+        # q_nope: [batch_size, seq_len, n_heads, kv_lora_rank]
+        # q_rope: [batch_size, seq_len, n_heads, qk_rope_head_dim]
 
+        q_nope, q_rope = torch.split(
+            q,
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
 
+        q_rope = apply_rotary_emb(q_rope, freqs_cis)
 
+        # [batch_size, seq_len, n_heads, kv_lora_rank + qk_rope_head_dim] -> [batch_size, n_heads, seq_len, kv_lora_rank + qk_rope_head_dim]
+        q = torch.cat([q_nope, q_rope], dim=-1).transpose(1, 2)
+
+        # latent_raw: [batch_size, seq_len, kv_lora_rank]
+        # k_rope: [batch_size, seq_len, qk_rope_head_dim]
+        latent_raw, k_rope = torch.split(
+            self.wkv_a(x), # [batch_size, seq_len, dim] -> [batch_size, seq_len, kv_lora_rank + qk_rope_head_dim]
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+
+        # This is the latent that should be cached.
+        # latent: [batch_size, seq_len, kv_lora_rank]
+        latent = self.kv_norm(latent_raw)
+
+        # [batch_size, seq_len, 1, qk_rope_head_dim]
+        k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freqs_cis)
+
+        # A single shared storage tensor:
+        # shared_cache: [batch_size, seq_len, 1, kv_lora_rank + qk_rope_head_dim] -> [batch_size, 1, seq_len, kv_lora_rank + qk_rope_head_dim]
+        # the reason we have 1 here is that we only use 1 absorbed k tensor for all the heads.
+        shared_cache = torch.cat(
+            [latent.unsqueeze(2), k_rope],
+            dim=-1,
+        ).transpose(1, 2)
+        # k: [batch_size, 1, seq_len, kv_lora_rank + qk_rope_head_dim]
+        k = shared_cache
+        # v: [batch_size, 1, seq_len, kv_lora_rank]
+        v = shared_cache[..., : self.kv_lora_rank]
+
+        # latent_output: [batch_size, n_heads, seq_len, kv_lora_rank]
+        latent_output = self.inner_attention(q, k, v, scale=self.softmax_scale)
+
+        # [batch_size, seq_len, n_heads * kv_lora_rank]
+        latent_output = latent_output.transpose(1, 2).contiguous().view(
+            batch_size,
+            seq_len,
+            self.n_heads * self.kv_lora_rank,
+        )
+
+        # output: [batch_size, seq_len, dim]
+        return self.wo_abs(latent_output)
 
 
 
@@ -227,6 +315,10 @@ class TransformerBlock(nn.Module):
         self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
+        # This is different from the GPT2-style initialisation, as visible in the HF implementation: https://github.com/huggingface/transformers/blob/39603d0e5cdb6f00e8d473d7fcbb01032d709181/src/transformers/models/gpt2/modeling_gpt2.py#L448-L458
+        self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
+        self.layer_id = layer_id
+
         self.moe_enabled = layer_id >= model_args.n_dense_layers
         if self.moe_enabled:
             self.moe = MoE(
@@ -236,10 +328,6 @@ class TransformerBlock(nn.Module):
             )
         else:
             self.feed_forward = FeedForward(model_args.dim, model_args.inter_dim)
-
-            # This is different from the GPT2-style initialisation, as visible in the HF implementation: https://github.com/huggingface/transformers/blob/39603d0e5cdb6f00e8d473d7fcbb01032d709181/src/transformers/models/gpt2/modeling_gpt2.py#L448-L458
-            self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
-            self.layer_id = layer_id
 
         
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor):
@@ -289,7 +377,7 @@ class DeepSeekV3Model(nn.Module):
     def __init__(self, model_args: DeepSeekV3ModelArgs):
         super().__init__()
         self.model_args = model_args
-        self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.d_model)
+        self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
         self.register_buffer(
             "freqs_cis", precompute_freqs_cis(model_args), persistent=False
         ) # persis = False means that the buffer is not saved to the checkpoint (not in the state_dict)
@@ -298,11 +386,11 @@ class DeepSeekV3Model(nn.Module):
         for layer_id in range(model_args.n_layers):
             self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
 
-        self.norm = nn.RMSNorm(model_args.dim)
+        self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.output = nn.Linear(
             model_args.dim,
             model_args.vocab_size,
-            dtype=torch.default_dtype,
+            dtype=torch.get_default_dtype(),
             bias=False,
         )
 
