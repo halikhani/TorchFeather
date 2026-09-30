@@ -133,8 +133,6 @@ class Trainer(Stateful):
         ):
             model = DeepSeekV3Model(model_args)
 
-        self.metrics_processor = MetricsProcessor(job_config, parallel_dims)
-
         # why meta device?
         #         meta parameter
         #     |
@@ -152,7 +150,80 @@ class Trainer(Stateful):
         #     v
         # actual initialized GPU parameters
 
+
+        self.metrics_processor = MetricsProcessor(job_config, parallel_dims)
+
+        # calculate model size and flops per token
+        (
+            model_param_count,
+            self.metrics_processor.num_flops_per_token,
+        ) = model_args.get_nparams_and_flops(model, job_config.training.seq_len)
+
+        logger.info(f"Model total parameters: {model_param_count:,}")
+
+        self.loss_fn = build_cross_entropy_loss(job_config)
+
+        # verify batch sizes
+        global_batch_size = job_config.training.global_batch_size
+        if global_batch_size < 0:
+            global_batch_size = job_config.training.local_batch_size * dp_degree
+        assert global_batch_size > 0, global_batch_size
+
+        # This is when you specify the global batch size manually.
+        # It is useful for validation of your config
         
+        assert (
+            global_batch_size % (job_config.training.local_batch_size * dp_degree) == 0
+        ), (global_batch_size, (job_config.training.local_batch_size * dp_degree))
+
+        # calculate gradient accumulation steps
+        self.gradient_accumulation_step = global_batch_size // (
+            job_config.training.local_batch_size * dp_degree
+        )
+
+        assert self.gradient_accumulation_steps > 0
+
+        init_device = device_type
+        buffer_device = None
+
+        # apply parallelisms and initialization
+        if parallel_dims.pp_enabled:
+            (
+                self.pp_schedule,
+                self.model_parts,
+                self.pp_has_first_stage,
+                self.pp_has_last_stage,
+            ) = pipeline_llm(
+                model,
+                parallel_dims,
+                job_config,
+                self.device,
+                model_args.n_layers,
+                parallelize_deepseekv3,
+                self.loss_fn,
+            )
+
+            # when PP is enabled, `model` obj is no longer used after this point, model_parts is used instead
+            del model
+
+            for m in self.model_parts:
+                m.to_empty(device=init_device)
+                with torch.no_grad():
+                    m.init_weights(buffer_device=buffer_device)  # ty:ignore[call-non-callable]
+                m.train()
+
+        else:
+            model = parallelize_deepseekv3(model, parallel_dims, job_config)
+
+            model.to_empty(device=init_device)
+            with torch.no_grad():
+                model.init_weights(buffer_device=buffer_device)
+            model.train()
+
+            self.model_parts = [model]
+
+            
+
 
 
             
