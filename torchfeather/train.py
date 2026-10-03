@@ -222,7 +222,104 @@ class Trainer(Stateful):
 
             self.model_parts = [model]
 
-            
+        
+        # initialize device memory monitor and get peak flops for MFU calculation
+        device_memory_monitor = self.metrics_processor.device_memory_monitor
+        gpu_peak_flops = utils.get_peak_flops(device_memory_monitor.device_name)
+        logger.info(f"Peak FLOPS used for computing MFU: {gpu_peak_flops:.3e}")
+        device_mem_stats = device_memory_monitor.get_peak_stats()
+        logger.info(
+            f"{device_type.upper()} memory usage for model: "
+            f"{device_mem_stats.max_reserved_gib:.2f}GiB"
+            f"({device_mem_stats.max_reserved_pct:.2f}%)"
+        )
+
+        # build optimizer after applying parallelisms to the model
+        self.optimizers = build_optimizers_with_moe_load_balancing(
+            self.model_parts, job_config.optimizer, parallel_dims
+        )
+        self.lr_schedulers = build_lr_schedulers(
+            self.optimizers, job_config.lr_scheduler, job_config.training.steps
+        )
+        self.metrics_processor.optimizers = self.optimizers
+        self.metrics_processor.model_parts = self.model_parts
+
+        # Initialize trainer states that will be saved in checkpoint.
+        # These attributes must be initialized before checkpoint loading.
+        self.step = 0
+        self.ntokens_seen = 0
+
+        self.checkpointer = CheckpointManager(
+            dataloader=self.dataloader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            additional_states={"train_state": self},
+            checkpoint_config=job_config.checkpoint,
+            base_folder=job_config.job.dump_folder,
+        )
+
+        loss_parallel_enabled = (
+            parallel_dims.tp_enabled and not parallelism_config.disable_loss_parallel
+        )
+        self.train_context = dist_utils.get_train_context(
+            loss_parallel_enabled,
+            parallelism_config.enable_compiled_autograd,
+        )
+        self.maybe_enable_amp = dist_utils.maybe_enable_amp(
+            parallel_dims,
+            job_config.training.mixed_precision_param,
+            device_type,
+        )
+
+        logger.info(
+            "Trainer is initialized with "
+            f"local batch size {job_config.training.local_batch_size}, "
+            f"global batch size {global_batch_size}, "
+            f"gradient accumulation steps {self.gradient_accumulation_steps}, "
+            f"sequence length {job_config.training.seq_len}, "
+            f"total steps {job_config.training.steps} "
+            f"(warmup {job_config.lr_scheduler.warmup_steps})"
+        )
+
+
+    def _create_parallel_dims(
+        self, parallelism_config: Parallelism, world_size: int
+    ) -> ParallelDims:
+        return ParallelDims(
+            dp_shard=parallelism_config.data_parallel_shard_degree,
+            dp_replicate=parallelism_config.data_parallel_replicate_degree,
+            cp=parallelism_config.context_parallel_degree,
+            tp=parallelism_config.tensor_parallel_degree,
+            pp=parallelism_config.pipeline_parallel_degree,
+            ep=parallelism_config.expert_parallel_degree,
+            etp=parallelism_config.expert_tensor_parallel_degree,
+            world_size=world_size,
+        )
+
+    
+    @record
+    def train(self):
+        job_config = self.job_config
+
+        self.checkpointer.load(step=job_config.checkpoint.load_step)
+        logger.info(f"Training starts at step {self.step + 1}")
+
+        with (
+            maybe_enable_profiling(
+                job_config.profiling,
+                global_step=self.step,
+                base_folder=job_config.job.dump_folder,
+                leaf_folder="",
+            ) as torch_profiler,
+            maybe_enable_memory_snapshot(
+                job_config.profiling,
+                global_step=self.step,
+                base_folder=job_config.job.dump_folder,
+                leaf_folder="",
+            ) as memory_profiler,
+        ):
+
 
 
 
