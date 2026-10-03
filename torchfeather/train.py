@@ -319,6 +319,79 @@ class Trainer(Stateful):
                 leaf_folder="",
             ) as memory_profiler,
         ):
+            data_iterator = self.batch_generator(self.dataloader)
+            while self.should_continue_training():
+                self.step += 1
+                self.gc_handler.run(self.step)
+                try:
+                    self.train_step(data_iterator)
+                except DataloaderExhaustedError:
+                    logger.warining("Ran out of data; last step was canceled.")
+                    break
+            
+                self.checkpointer.save(
+                    self.step, last_step=(self.step == job_config.training.steps)
+                )
+
+                # signal the profiler that the next profiling step has started
+                if torch_profiler:
+                    torch_profiler.step()
+                if memory_profiler:
+                    memory_profiler.step()
+                
+                # reduce timeout after first train step for faster signal (assuming lazy init and compilation are finished)
+                if self.step == 1:
+                    dist_utils.set_pg_timeouts(
+                        timeout=timedelta(
+                            seconds=job_config.comm.train_timeout_seconds
+                        ),
+                        parallel_dims=self.parallel_dims,
+                    )
+        
+        if torch.distributed.get_rank() == 0:
+            logger.info("Sleeping 2 seconds for other ranks to complete")
+            time.sleep(2)
+            logger.info("Training completed")
+
+def _arm_successful_shutdown_watchdog(timeout_seconds: int = 30) -> None:
+    logger.info(
+        "Arming post-training shutdown watchdog (SIGALRM) for {} seconds",
+        timeout_seconds,
+    )
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    signal.alarm(timeout_seconds)
+
+
+def _shutdown_after_successful_training(trainer: Trainer) -> None:
+    # Arm the watchdog before any close/destroy work begins so it can cover
+    # WandB/checkpoint cleanup, process-group teardown, and any later interpreter shutdown hang.  Uses SIGALRM+SIG_DFL so the kernel terminates the process regardless of GIL state or Python finalization.
+    # If the process exits normally before the timeout, the kernel discards the pending alarm automatically.
+    _arm_successful_shutdown_watchdog()
+    trainer.close()
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+        logger.info("Process group destroyed")
+
+        
+if __name__ == "__main__":
+    # Read the name of the config from the environment variable, and load the config.
+    CONFIG_NAME = os.environ.get("TORCHFEATHER_CONFIG", None)
+    if CONFIG_NAME is None:
+        raise ValueError("TORCHFEATHER_CONFIG environment variable is not set")
+
+    trainer: Trainer | None = None
+    try:
+        config = get_config(CONFIG_NAME)
+        config.job.dump_folder = f"./outputs/{CONFIG_NAME}"
+        trainer = Trainer(config)
+        trainer.train()
+    except Exception:
+        if trainer:
+            trainer.close()
+        raise
+    else:
+        _shutdown_after_successful_training(trainer)
+                
 
 
 
